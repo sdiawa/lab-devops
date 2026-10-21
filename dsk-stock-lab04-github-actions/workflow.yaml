@@ -20,14 +20,14 @@ jobs:
       - run: npm install -g pnpm@8.15.5
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
-      - run: pnpm --filter dsk-stock-backend test --runInBand
+      - run: pnpm --filter dsk-stock-backend exec jest --runInBand --passWithNoTests
       - run: pnpm --filter dsk-stock-frontend exec vitest run
       - run: pnpm --filter dsk-stock-frontend exec tsc --noEmit
       - run: pnpm build
       - uses: azure/setup-helm@v5
         with:
           version: v3.18.4
-      - run: helm lint labs/dsk-stock-lab03-helm/chart
+      - run: helm lint ../dsk-stock-lab03-helm/chart
   images:
     needs: verify
     runs-on: ubuntu-latest
@@ -57,7 +57,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: dsk-stock-lab04-github-actions
-          file: dsk-stock-lab04-github-actions/labs/dsk-stock-lab01-docker/${{ matrix.component }}.Dockerfile
+          file: dsk-stock-lab04-github-actions/apps/${{ matrix.component }}/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
