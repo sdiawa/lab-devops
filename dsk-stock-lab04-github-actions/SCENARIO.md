@@ -698,6 +698,404 @@ kubectl logs -n stock-lab04 job/NOM_DU_JOB
 
 Ne relancez pas aveuglément une migration non idempotente. Identifiez l'erreur SQL/Prisma et l'état réel du schéma avant de corriger.
 
+
+
+## 10 bis. Atelier guidé : reproduire l'installation complète de A à Z
+
+> Cette partie complète les étapes précédentes. Elle détaille les manipulations qui avaient été seulement résumées : utilisateur du runner, enregistrement GitHub, kubeconfig, rotation de token, Secret PostgreSQL/JWT, résolution DNS sur **la VM et le PC**, et contrôles à chaque étape. **Ne rejouez pas les commandes de création sur un environnement déjà opérationnel sans comprendre leur effet.** Les commandes marquées *première installation* sont destinées à un cluster neuf.
+
+### A. Inventaire et responsabilités des machines
+
+| Élément | Exemple du lab réalisé | Où exécuter ? | Pourquoi ? |
+|---|---|---|---|
+| VM Ubuntu / K3s | `lab`, `10.0.0.50` | Terminal SSH de la VM | Héberge le cluster, Traefik, l'application et le runner |
+| Poste de travail | Mac | Terminal macOS et navigateur | Teste le DNS et l'accès utilisateur |
+| Dépôt Git | `prod0751/lab-devops` | GitHub et clone de la VM | Contient les sources, chart et workflow |
+| Namespace | `stock-lab04` | Kubernetes | Isole logiquement les ressources de l'exercice |
+| Release Helm | `stock` | Kubernetes | Historique des installations/mises à jour |
+| Ingress | `stock.stockage.dsk` | Kubernetes + DNS client | Point d'entrée HTTP de l'application |
+| Secret | `stock-secrets` | Kubernetes | Identifiants de la base et secret JWT |
+| Runner | `lab-k3s-runner` | VM + GitHub | Exécute le job CD dans le réseau privé |
+
+**À expliquer à l'apprenant :** le `root` Linux, le compte GitHub `prod0751`, l'utilisateur système `github-runner` et le ServiceAccount Kubernetes `stock-lab04-deployer` sont **quatre identités différentes**. Les confondre mène à des erreurs de permission et à des failles de sécurité.
+
+```bash
+# Sur la VM Ubuntu (avec un compte administrateur)
+hostname -I
+cat /etc/os-release | head -6
+free -h
+nproc
+sudo k3s kubectl get nodes -o wide
+sudo k3s kubectl get storageclass
+sudo k3s kubectl get pods -n kube-system
+```
+
+**Pourquoi ?** Valider que K3s fonctionne avant d'accuser GitHub Actions d'un problème d'infrastructure. Dans notre lab, la StorageClass par défaut était `local-path`. Ce stockage est local au nœud : il ne remplace pas une stratégie de sauvegarde.
+
+### B. Créer le Secret applicatif `stock-secrets` — première installation
+
+Le Secret n'est **pas** un compte utilisateur GitHub et ne sert **pas** à connecter le runner. Il fournit au backend, au Job de migration et à PostgreSQL les variables attendues par leurs conteneurs.
+
+**Important :** les noms exacts des variables doivent être vérifiés dans `chart/templates/postgres.yaml`, `app.yaml`, `migrate.yaml`, les fichiers Prisma et `chart/templates/secret.yaml`. Le chart d'origine utilisait une configuration PostgreSQL et JWT ; ne devinez pas un nom de variable si votre version a changé.
+
+```bash
+cd /root/devops-labs/lab-devops
+# Lire les noms de variables attendus sans afficher de Secret existant
+grep -RnE 'DATABASE_URL|POSTGRES_(USER|PASSWORD|DB)|JWT_SECRET|secretKeyRef|secretRef' \
+  dsk-stock-lab04-github-actions/chart/templates \
+  dsk-stock-lab04-github-actions/apps/backend \
+  --exclude-dir=node_modules --exclude-dir=dist | head -80
+```
+
+Pour le **schéma habituel de cette application**, les clés sont `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `DATABASE_URL`, `JWT_SECRET`. Si la vérification précédente confirme ces clés, créer le Secret de façon interactive **sans écrire les valeurs dans Git ni dans l'historique shell** :
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl create namespace stock-lab04 --dry-run=client -o yaml | kubectl apply -f -
+
+# Première installation uniquement : ne remplacez pas un Secret existant
+kubectl get secret stock-secrets -n stock-lab04 && echo 'Secret déjà présent : ne pas écraser'
+
+# À exécuter SEULEMENT si le Secret est absent et si les clés ont été confirmées :
+read -r -p 'Utilisateur PostgreSQL : ' DB_USER
+read -r -p 'Base PostgreSQL : ' DB_NAME
+read -r -s -p 'Mot de passe PostgreSQL : ' DB_PASSWORD; echo
+JWT_SECRET_VALUE="$(openssl rand -hex 32)"
+export DB_USER DB_NAME DB_PASSWORD JWT_SECRET_VALUE
+python3 - <<'PYSECRET'
+import os
+from urllib.parse import quote
+u=quote(os.environ['DB_USER'], safe='')
+p=quote(os.environ['DB_PASSWORD'], safe='')
+d=quote(os.environ['DB_NAME'], safe='')
+# DATABASE_URL au format Prisma/PostgreSQL, service postgres dans le même namespace
+with open('/tmp/stock-lab04-db-url', 'w') as f:
+    f.write(f'postgresql://{u}:{p}@postgres:5432/{d}?schema=public')
+os.chmod('/tmp/stock-lab04-db-url', 0o600)
+PYSECRET
+kubectl -n stock-lab04 create secret generic stock-secrets \
+  --from-literal=POSTGRES_USER="$DB_USER" \
+  --from-literal=POSTGRES_PASSWORD="$DB_PASSWORD" \
+  --from-literal=POSTGRES_DB="$DB_NAME" \
+  --from-file=DATABASE_URL=/tmp/stock-lab04-db-url \
+  --from-literal=JWT_SECRET="$JWT_SECRET_VALUE"
+rm -f /tmp/stock-lab04-db-url
+unset DB_USER DB_NAME DB_PASSWORD JWT_SECRET_VALUE
+```
+
+**Attention à la sécurité :** les arguments `--from-literal` peuvent être visibles temporairement dans la liste des processus ; pour un environnement sensible, utilisez un mécanisme de gestion de secrets dédié (Vault/ESO, Sealed Secrets ou équivalent) plutôt que cette procédure pédagogique. Un Secret Kubernetes est encodé en base64, **pas chiffré par nature** ; configurez le chiffrement au repos et des RBAC stricts pour un cluster de production. Ne copiez jamais la sortie de `kubectl get secret -o yaml` dans un compte rendu.
+
+```bash
+kubectl get secret stock-secrets -n stock-lab04
+kubectl get secret stock-secrets -n stock-lab04 \
+  -o go-template='{{range $k,$v := .data}}{{printf "%s\n" $k}}{{end}}'
+```
+
+**Résultat attendu :** le Secret existe et les cinq **noms** de clés sont présents ; leurs valeurs ne sont pas affichées. Vérifiez que `existingSecret: stock-secrets` est défini dans `values.lab04.yaml`. **Ne relancez pas cette création** si la base est déjà utilisée : modifier le mot de passe sans migration peut empêcher PostgreSQL de démarrer ou le backend de se connecter.
+
+### C. Installer le runner GitHub Actions sur la VM — première installation
+
+**Pourquoi ne pas tout exécuter sur `ubuntu-latest` ?** Les runners GitHub peuvent construire les images, mais ils ne sont pas nécessairement connectés au réseau privé `10.0.0.0/24`. Notre runner auto-hébergé est installé sur la VM K3s. Cette cohabitation est acceptable pour un lab, mais séparer runner et cluster serait préférable dans une architecture plus robuste.
+
+```bash
+# Administrateur sur la VM Ubuntu
+sudo useradd --create-home --shell /bin/bash github-runner
+id github-runner
+sudo install -d -o github-runner -g github-runner -m 700 \
+  /home/github-runner/actions-runner
+# L'utilisateur ne doit pas appartenir au groupe sudo
+id -nG github-runner
+```
+
+Si `github-runner` existe déjà, **ne recréez pas le compte**. Ouvrez ensuite GitHub → `prod0751/lab-devops` → **Settings → Actions → Runners → New self-hosted runner** → Linux → x64. GitHub affiche des commandes adaptées à la version courante : URL de téléchargement, somme SHA-256, extraction et `config.sh` avec un **token d'enregistrement temporaire**. Reprenez **ces commandes officielles** dans le répertoire du runner, en tant qu'utilisateur non root. Ne collez jamais le token dans un document ou dans Git.
+
+```bash
+# L'administrateur ouvre une session sous l'identité du runner
+sudo -iu github-runner
+cd ~/actions-runner
+# Exécuter ici les commandes de téléchargement et de vérification fournies par GitHub.
+# Puis la commande ./config.sh --url ... --token ... fournie par GitHub.
+# Réponses typiques : nom = lab-k3s-runner ; groupe = Default ; workdir = _work.
+exit
+```
+
+Installer ensuite le service systemd en tant qu'administrateur (les scripts `svc.sh` sont fournis par le paquet officiel) :
+
+```bash
+cd /home/github-runner/actions-runner
+sudo ./svc.sh install github-runner
+sudo ./svc.sh start
+sudo ./svc.sh status
+systemctl list-units --type=service 'actions.runner*'
+```
+
+**Validation :** dans GitHub, le runner apparaît **Online / Idle**. Sur la VM, le service est `active (running)`. Dans notre réalisation, le service était `actions.runner.prod0751-lab-devops.lab-k3s-runner.service`. Il n'est pas nécessaire de lancer `./run.sh` à la main si systemd gère déjà le runner.
+
+**Risque pédagogique à discuter :** un workflow qui s'exécute sur un runner self-hosted peut lire les fichiers auxquels cet utilisateur a accès. Réservez le job `deploy` aux pushes de confiance sur `main`, contrôlez les collaborateurs et évitez les PR non fiables. Les protections de branche sont recommandées, même si nous avons choisi de ne pas les activer pendant ce lab.
+
+### D. Installer Helm et vérifier kubectl pour le runner
+
+```bash
+# Sur la VM
+command -v helm && helm version --short
+command -v kubectl && kubectl version --client
+sudo -u github-runner bash -c 'command -v helm; helm version --short; command -v kubectl'
+```
+
+Dans notre lab, Helm était installé dans `/usr/local/bin/helm` et `kubectl` dans `/usr/local/bin/kubectl`. **Attention :** `kubectl version --client` peut afficher un avertissement indiquant qu'il ne peut pas lire `/etc/rancher/k3s/k3s.yaml` ; ce n'est pas nécessairement une panne du client. Pour les commandes réseau du runner, indiquez explicitement **son** `KUBECONFIG` restreint.
+
+### E. Créer l'identité Kubernetes du runner et ses permissions RBAC
+
+Appliquez le manifeste ServiceAccount/Role/RoleBinding de la section 4.3. Le rôle autorise les ressources du chart dans **`stock-lab04` uniquement**, dont `ingresses` du groupe `networking.k8s.io`.
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+kubectl get serviceaccount stock-lab04-deployer -n stock-lab04
+kubectl get role,rolebinding -n stock-lab04
+kubectl auth can-i get ingresses -n stock-lab04 \
+  --as=system:serviceaccount:stock-lab04:stock-lab04-deployer
+kubectl auth can-i create clusterrolebindings \
+  --as=system:serviceaccount:stock-lab04:stock-lab04-deployer
+```
+
+**Attendu :** `yes` pour les Ingress du namespace et `no` pour les ClusterRoleBindings. Lors de notre déploiement, un oubli des droits Ingress a provoqué `UPGRADE FAILED ... ingresses is forbidden`. Le bon correctif est **d'ajouter la règle RBAC manquante**, pas d'accorder `cluster-admin`.
+
+### F. Construire le kubeconfig restreint du runner
+
+Le kubeconfig est une **configuration de connexion** : URL de l'API Kubernetes, certificat CA, identité et contexte. Un token ServiceAccount de durée limitée remplace les identifiants administrateur. Dans notre cas, runner et API K3s sont sur la même VM : `https://127.0.0.1:6443` est donc approprié. **Sur une VM runner distincte, cette adresse serait fausse** : il faudrait l'adresse réseau de l'API et un certificat compatible.
+
+```bash
+# Exécuter en administrateur sur la VM K3s
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+sudo install -d -m 700 -o github-runner -g github-runner /home/github-runner/.kube
+
+# Le token est temporaire ; ne l'affichez pas, ne le commitez pas.
+TOKEN="$(kubectl -n stock-lab04 create token stock-lab04-deployer --duration=24h)"
+# Extraction du CA du kubeconfig administrateur (la donnée CA est publique)
+kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+  | base64 -d > /tmp/stock-lab04-ca.crt
+
+# Création d'un kubeconfig neuf et indépendant du kubeconfig admin
+TMP_CONFIG="$(mktemp)"
+chmod 600 "$TMP_CONFIG"
+kubectl config --kubeconfig="$TMP_CONFIG" set-cluster lab-k3s \
+  --server=https://127.0.0.1:6443 \
+  --certificate-authority=/tmp/stock-lab04-ca.crt --embed-certs=true
+kubectl config --kubeconfig="$TMP_CONFIG" set-credentials stock-lab04-deployer --token="$TOKEN"
+kubectl config --kubeconfig="$TMP_CONFIG" set-context stock-lab04 \
+  --cluster=lab-k3s --user=stock-lab04-deployer --namespace=stock-lab04
+kubectl config --kubeconfig="$TMP_CONFIG" use-context stock-lab04
+sudo install -m 600 -o github-runner -g github-runner "$TMP_CONFIG" \
+  /home/github-runner/.kube/config
+rm -f "$TMP_CONFIG" /tmp/stock-lab04-ca.crt
+unset TOKEN TMP_CONFIG
+
+sudo -u github-runner env KUBECONFIG=/home/github-runner/.kube/config \
+  kubectl get deployments -n stock-lab04
+sudo -u github-runner env KUBECONFIG=/home/github-runner/.kube/config \
+  kubectl auth can-i update deployments -n stock-lab04
+```
+
+**Résultat attendu :** le runner voit les Deployments et répond `yes` pour leur mise à jour. Le fichier est lisible seulement par `github-runner` (et root). Si `kubectl` échoue avec `Unauthorized`, vérifiez la validité du token ; si `Forbidden`, vérifiez les RBAC ; si `connection refused`, vérifiez K3s et l'URL de l'API.
+
+### G. Renouveler automatiquement le token : script et timer systemd
+
+Un token créé avec `--duration=24h` finit par expirer. Un déploiement qui fonctionne aujourd'hui peut échouer demain. Dans notre lab, nous avons créé un **service systemd root** et un **timer toutes les 12 heures**. Le script suivant reconstitue ce principe sans donner à l'utilisateur runner accès au kubeconfig administrateur.
+
+```bash
+sudo tee /usr/local/sbin/refresh-stock-runner-token.sh >/dev/null <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+DEST=/home/github-runner/.kube/config
+TMP="$(mktemp /home/github-runner/.kube/.config.XXXXXX)"
+trap 'rm -f "$TMP"' EXIT
+TOKEN="$(kubectl -n stock-lab04 create token stock-lab04-deployer --duration=24h)"
+cp "$DEST" "$TMP"
+kubectl config --kubeconfig="$TMP" set-credentials stock-lab04-deployer --token="$TOKEN" >/dev/null
+chown github-runner:github-runner "$TMP"
+chmod 600 "$TMP"
+mv -f "$TMP" "$DEST"
+unset TOKEN
+SCRIPT
+sudo chown root:root /usr/local/sbin/refresh-stock-runner-token.sh
+sudo chmod 700 /usr/local/sbin/refresh-stock-runner-token.sh
+sudo bash -n /usr/local/sbin/refresh-stock-runner-token.sh
+```
+
+```ini
+# /etc/systemd/system/stock-runner-token-refresh.service
+[Unit]
+Description=Refresh restricted K3s token for GitHub runner
+After=k3s.service
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/refresh-stock-runner-token.sh
+```
+
+```ini
+# /etc/systemd/system/stock-runner-token-refresh.timer
+[Unit]
+Description=Refresh stock runner token every 12 hours
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=12h
+Persistent=true
+Unit=stock-runner-token-refresh.service
+[Install]
+WantedBy=timers.target
+```
+
+Créez ces deux fichiers `.service` et `.timer` avec `sudo nano`, puis :
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now stock-runner-token-refresh.timer
+sudo systemctl start stock-runner-token-refresh.service
+systemctl status stock-runner-token-refresh.service --no-pager
+systemctl list-timers --all | grep stock-runner
+sudo journalctl -u stock-runner-token-refresh.service -n 15 --no-pager
+sudo -u github-runner env KUBECONFIG=/home/github-runner/.kube/config \
+  kubectl get deployments -n stock-lab04
+```
+
+**Sécurité et limites :** le timer doit être surveillé ; l'API peut accorder une durée inférieure aux 24 h demandées ; la rotation ne résout pas les problèmes de disponibilité de K3s. Ce montage est une solution **pédagogique de lab**, pas un modèle universel de gestion d'identités en production.
+
+### H. Tester le runner et la chaîne GitHub Actions
+
+Le workflow contient trois jobs logiques : `verify` (tests), `images` (publication GHCR), puis `deploy` (Helm). Le déploiement ne doit s'exécuter qu'après réussite des deux premiers, sur un push vers `main`.
+
+```yaml
+# Extrait du job deploy
+needs: [verify, images]
+if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+runs-on: [self-hosted, Linux, X64]
+```
+
+**Pourquoi ?** `needs` ordonne les jobs, `if` protège le déploiement contre un déclenchement par pull request et `runs-on` choisit le runner connecté au cluster. La commande Helm `--atomic --wait --wait-for-jobs` attend les workloads et les Jobs ; elle peut restaurer la release en cas d'échec, **mais ne restaure pas automatiquement les migrations SQL déjà exécutées**.
+
+```bash
+# Depuis la racine Git
+/root/go/bin/actionlint .github/workflows/stock-labs.yaml  # si installé ici
+helm lint dsk-stock-lab04-github-actions/chart \
+  -f dsk-stock-lab04-github-actions/chart/values.lab04.yaml
+git diff --check
+git status --short
+```
+
+Ne copiez pas aveuglément un chemin `actionlint` qui n'existe pas : `command -v actionlint` permet de vérifier l'installation. Dans GitHub → **Actions**, cherchez les jobs `verify`, `images (backend)`, `images (frontend)`, `Deploy to K3s` et examinez les logs si l'un échoue.
+
+### I. Expliquer la configuration réseau sur la VM ET sur le PC
+
+**Piège fréquent :** créer un Ingress Kubernetes ne crée pas de DNS. Le navigateur a besoin de convertir `stock.stockage.dsk` en `10.0.0.50`. Chaque machine possède sa propre résolution de noms. Modifier `/etc/hosts` **sur la VM ne modifie pas celui du Mac**, et inversement.
+
+**1. Sur la VM Ubuntu (si votre DNS local ne connaît pas le nom) :**
+
+```bash
+sudo nano /etc/hosts
+# Ajouter : 10.0.0.50 stock.stockage.dsk
+getent hosts stock.stockage.dsk
+curl -I http://stock.stockage.dsk/
+```
+
+**2. Sur le Mac :**
+
+```bash
+sudo nano /etc/hosts
+# Ajouter la même correspondance : 10.0.0.50 stock.stockage.dsk
+dscacheutil -q host -a name stock.stockage.dsk
+curl -I http://stock.stockage.dsk/
+```
+
+Si la résolution semble mise en cache sous macOS, vous pouvez renouveler le cache DNS :
+
+```bash
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
+```
+
+**3. Tester Traefik même sans DNS :**
+
+```bash
+curl -I --resolve stock.stockage.dsk:80:10.0.0.50 \
+  http://stock.stockage.dsk/
+curl -i --resolve stock.stockage.dsk:80:10.0.0.50 \
+  http://stock.stockage.dsk/api/products
+```
+
+Le paramètre `--resolve` force `curl` à joindre l'IP tout en envoyant le **bon Host HTTP**. Un `200` sur `/` indique que le frontend est accessible ; un `401` sur `/api/products` **sans authentification** prouve que la route API est atteinte et protégée. En revanche, `404` sur `/api` seul peut être normal car le backend ne définit pas forcément cette route.
+
+**4. Vérifier les objets Kubernetes :**
+
+```bash
+kubectl get svc traefik -n kube-system
+kubectl get ingress stock -n stock-lab04
+kubectl describe ingress stock -n stock-lab04
+kubectl get svc -n stock-lab04
+kubectl exec -n stock-lab04 deployment/frontend -- \
+  cat /usr/share/nginx/html/env.js
+```
+
+Dans notre lab, Traefik utilisait un Service `LoadBalancer` exposant `10.0.0.50:80` et un NodePort sous-jacent. Le navigateur utilisait **le port 80 du LoadBalancer**, pas directement le NodePort. Le frontend et le backend étaient des Services `ClusterIP` ; l'Ingress distribuait `/` vers le frontend et `/api` vers le backend. Le fichier `env.js` devait contenir `apiBaseUrl: "/api"`, et non une URL de `port-forward` temporaire.
+
+**5. Si le navigateur montre la page « Congratulations! Nginx Proxy Manager » :** le nom pointe probablement vers un autre proxy ou une autre IP que Traefik. Comparez la résolution DNS, l'IP du Service Traefik et le résultat de `curl --resolve`. Ne modifiez pas l'Ingress au hasard.
+
+**6. Pour une infrastructure durable :** remplacez les entrées `/etc/hosts` manuelles par un enregistrement dans le DNS interne (par exemple votre serveur `dnsmasq`). Cela évite de répéter la configuration sur chaque poste. **Le site est actuellement en HTTP** : utilisez uniquement des identifiants de test et ajoutez HTTPS/TLS avant une utilisation réelle.
+
+### J. Vérification de bout en bout et preuve de persistance
+
+```bash
+helm history stock -n stock-lab04
+kubectl get deployments,pods,jobs,ingress -n stock-lab04
+kubectl get deployments -n stock-lab04 \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image'
+```
+
+**Résultats observés pendant notre réalisation :** release Helm révision 2 `deployed`, Deployments frontend/backend `1/1`, Job `stock-migrate-2` terminé, images GHCR taguées avec le SHA `70f597795dcc17950018178693d0e9ff623edda6`. Ces valeurs sont **des preuves de notre session**, pas des valeurs garanties pour les prochains apprenants.
+
+Depuis le Mac : ouvrez `http://stock.stockage.dsk`, créez un **compte de test**, connectez-vous, ajoutez `Clavier USB`, SKU `CLAV-USB-001`, catégorie `Informatique`, emplacement `Stock A1`, quantité `10`, prix `25`, seuil `3`. Vérifiez le dashboard : `1` produit, `250 €` de valeur, `0` alerte, si la base était vide. Rechargez la page ; pour tester plus solidement la persistance, redémarrez **seulement** le Pod backend, puis rechargez. Ne supprimez ni le PVC ni le namespace.
+
+```bash
+kubectl rollout restart deployment/backend -n stock-lab04
+kubectl rollout status deployment/backend -n stock-lab04 --timeout=180s
+kubectl get pvc -n stock-lab04
+```
+
+**Ce qu'il faut expliquer :** la persistance des produits est assurée par PostgreSQL et son volume, pas par le conteneur frontend. Un dashboard correct après un rechargement est un bon test fonctionnel, mais une stratégie de sauvegarde et de restauration doit encore être prévue.
+
+### K. Diagnostic méthodique des incidents rencontrés
+
+| Symptôme | Interprétation possible | Premier contrôle |
+|---|---|---|
+| `ingresses is forbidden` dans Helm | RBAC du ServiceAccount incomplet | `kubectl auth can-i get ingresses --as=...` |
+| `Unauthorized` sur Kubernetes | Token expiré / invalide | service de rotation et kubeconfig du runner |
+| `ImagePullBackOff` | Image privée, tag erroné ou problème réseau | `kubectl describe pod`, GHCR et `imagePullSecrets` |
+| `curl: Could not resolve host` | DNS ou `/etc/hosts` du poste non configuré | `getent hosts` (Linux), `dscacheutil` (Mac) |
+| Page Nginx Proxy Manager | Requête envoyée au mauvais reverse proxy | `curl --resolve`, DNS et IP Traefik |
+| `GET /api` retourne 404 | Route `/api` absente | Tester une vraie route telle que `/api/products` |
+| `/api/products` retourne 401 | Route accessible, authentification requise | Tester depuis la session authentifiée |
+| Page OK mais API cassée | `env.js` ou routage Ingress incorrect | Lire `env.js`, inspecter l'Ingress |
+| Migration en erreur | Schéma DB, Secret, réseau ou image | `kubectl logs job/stock-migrate-N` |
+| `helm upgrade` échoue | Ressource manquante, RBAC, Pod/Job non prêt | Logs Actions, `helm history`, `kubectl describe` |
+
+### L. Ce qu'un apprenti doit être capable d'expliquer à l'oral
+
+1. Pourquoi avons-nous **deux types de runners** dans le même workflow ?
+2. Pourquoi le runner Linux **n'est pas root** et n'utilise pas le kubeconfig administrateur ?
+3. Quelle différence entre le compte `github-runner` et le ServiceAccount `stock-lab04-deployer` ?
+4. Pourquoi faut-il **renouveler le token** ? Qu'arrive-t-il s'il expire ?
+5. Que contient `stock-secrets` ? Pourquoi ne doit-il pas être commité ?
+6. Pourquoi la VM et le Mac ont-ils chacun leur propre fichier `/etc/hosts` ?
+7. Quelle différence entre **ClusterIP**, **NodePort**, **LoadBalancer**, **Ingress** et **Ingress Controller** ?
+8. Pourquoi `GET /api/products` renvoie-t-il `401` avant connexion ?
+9. Pourquoi taguer les images avec le SHA Git plutôt qu'uniquement `latest` ?
+10. Que fait Helm avec `--atomic --wait --wait-for-jobs` ? Quelle est la limite concernant les migrations SQL ?
+11. Pourquoi un Pod `Running` ne suffit-il pas à valider l'application ?
+12. Quelle preuve démontre que le produit reste enregistré après un redémarrage du backend ?
+
+**Livrable supplémentaire :** capture du runner `Online`, capture des quatre jobs GitHub Actions réussis, sorties de `helm history` et `kubectl get`, captures du DNS sur VM et Mac, preuve d'une création de produit, et une explication écrite de deux incidents corrigés. **Masquez systématiquement** tokens, JWT, mots de passe, fichiers kubeconfig et identifiants personnels.
+
 ## 11. Exercices pour apprendre, pas seulement reproduire
 
 **Exercice 1 — Bloquer une mauvaise livraison.** Dans une branche de test, introduisez volontairement une erreur TypeScript, ouvrez une pull request et constatez que `verify` échoue. Vérifiez qu'aucun déploiement n'a eu lieu. Corrigez l'erreur et relancez.
@@ -764,7 +1162,3 @@ Si vous désactivez le workflow ou le runner, faites-le volontairement et docume
 - [Kubernetes RBAC](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)
 - [Kubernetes Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
 - [Helm : upgrade](https://helm.sh/docs/helm/helm_upgrade/)
-
----
-
-**Note pédagogique :** ce scénario enrichit le document initial du Lab 04. Les commandes et incidents de la réalisation sont présentés comme des exemples reproductibles, mais les adresses IP, les noms DNS, les permissions et les images doivent être adaptés et vérifiés dans chaque infrastructure. Le fonctionnement observé sur un homelab n'est pas une validation de sécurité pour une mise en production.
